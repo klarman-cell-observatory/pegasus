@@ -1,5 +1,8 @@
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import seaborn as sns
+
 
 from typing import Tuple, Union
 from pegasusio import UnimodalData, MultimodalData
@@ -46,7 +49,7 @@ def _cluster_data(data: MultimodalData, n_genes: int, percent_mito: float, mito_
 # lower_bound and upper_bound - maximum lower_co and minimum upper_co cutoff
 # Only keep "mad" and "outlier"
 def _metric_filter(data: MultimodalData, method: str, param: float, metric_name: str, do_lower_co: bool = False, do_upper_co: bool = False,
-                   lower_bound: float = INF, upper_bound: float = -INF, df_qc: pd.DataFrame = None) -> np.ndarray:
+                   lower_bound: float = 10 ** 10, upper_bound: float = -10 ** 10, df_qc: pd.DataFrame = None) -> np.ndarray:
     qc_pass = np.zeros(data.shape[0], dtype = bool) # T/F array to tell whether the cell is filtered
     if df_qc is not None:
         df_qc[f"{metric_name}_lower_co"] = None
@@ -68,9 +71,11 @@ def _metric_filter(data: MultimodalData, method: str, param: float, metric_name:
             upper_co = q75 + 1.5 * (q75 - q25)
 
         lower_co = min(lower_co, lower_bound)
-        upper_bound = max(upper_co, upper_bound)
+        upper_co = max(upper_co, upper_bound)
 
         qc_pass_cl = np.ones(values.size, dtype = bool)
+        if df_qc is not None:
+            df_qc.loc[idx, f"{metric_name}"] = values
         if do_lower_co:
             qc_pass_cl &= (values >= lower_co)
             if df_qc is not None:
@@ -79,6 +84,8 @@ def _metric_filter(data: MultimodalData, method: str, param: float, metric_name:
             qc_pass_cl &= (values <= upper_co)
             if df_qc is not None:
                 df_qc.loc[idx, f"{metric_name}_upper_co"] = upper_co
+        if df_qc is not None:
+            df_qc.loc[idx, f"{metric_name}_passed_qc"] = qc_pass_cl
         qc_pass[idx] = qc_pass_cl
 
     return qc_pass
@@ -93,6 +100,20 @@ def _reverse_to_raw_matrix(unidata: UnimodalData, obs_copy: pd.DataFrame, var_co
     unidata.uns = uns_copy
 
 
+def _boxplot_sorted(df, column, by, hline_x=None, log=False):
+    df_copy = df.loc[:, [column, by]]
+    if log:
+        df_copy[column] = np.log2(df_copy[column])
+    my_order = df_copy.groupby(by=by)[column].median().sort_values(ascending = False).index
+    fig, ax = plt.subplots(figsize=(15, 12))
+    chart = sns.boxplot(ax=ax, x=df_copy[by], y=df_copy[column], order=my_order)
+    if log:
+        ax.set_ylabel("log2({})".format(column))
+    if hline_x is not None:
+        chart.axhline(hline_x, color="red")
+    return chart
+
+
 # function that computes ddqc metrices
 # method - method name for filtering (mad or outlier)
 # threshold - parameter for the selected method
@@ -100,15 +121,15 @@ def _reverse_to_raw_matrix(unidata: UnimodalData, obs_copy: pd.DataFrame, var_co
 # n_genes_lower_bound - maximum cutoff for n genes
 # percent_mito_upper_bound - minimum cutoff for percent mito
 # return_df_qc: return a dataframe with cluster labels and thresholds for each metric
-def ddqc_metrics(data: MultimodalData, res=1.3, method="mad", threshold=2, basic_n_genes=100, percent_mito_upper_bound=10, mito_prefix="MT-",
-                 ribo_prefix="^RP[SL][[:digit:]]|^RPLP[[:digit:]]|^RPSA", do_counts=True, do_genes=True, do_mito=True, do_ribo=False, n_genes_lower_bound=200,
-                 basic_percent_mito=80, random_state=29, return_df_qc=False) -> Union[None, pd.DataFrame]:
+def ddqc_metrics(data: MultimodalData, res=1.3, method="mad", threshold=2, basic_n_genes=100, basic_percent_mito=80, mito_prefix="MT-",
+                 ribo_prefix="^RP[SL][[:digit:]]|^RPLP[[:digit:]]|^RPSA", do_counts=True, do_genes=True, do_mito=True,
+                 do_ribo=False, n_genes_lower_bound=200, percent_mito_upper_bound=10, random_state=29, return_df_qc=False,
+                 display_plots=True) -> Union[None, pd.DataFrame]:
     assert isinstance(data, MultimodalData)
-    obs_copy, var_copy, uns_copy = _cluster_data(data, basic_n_genes, basic_percent_mito, mito_prefix, ribo_prefix, random_state=random_state)
+    obs_copy, var_copy, uns_copy = _cluster_data(data, basic_n_genes, basic_percent_mito, mito_prefix, ribo_prefix,
+                                                 resolution=res, random_state=random_state)
 
-    df_qc = None
-    if return_df_qc:
-        df_qc = pd.DataFrame({"cluster_labels": data.obs["louvain_labels"].values}, index=data.obs_names)
+    df_qc = pd.DataFrame({"cluster_labels": data.obs["louvain_labels"].values}, index=data.obs_names)
 
     passed_qc = np.ones(data.shape[0], dtype = bool)
     # for each metric if do_metric is true, the filtering will be performed
@@ -123,5 +144,13 @@ def ddqc_metrics(data: MultimodalData, res=1.3, method="mad", threshold=2, basic
 
     _reverse_to_raw_matrix(data.current_data(), obs_copy, var_copy, uns_copy)
     data.obs["passed_qc"] = passed_qc
+    df_qc["passed_qc"] = data.obs["passed_qc"]
 
-    return df_qc
+    if display_plots:
+        _boxplot_sorted(df_qc, "n_genes", "cluster_labels", hline_x=np.log2(200), log=True)
+        plt.show()
+        _boxplot_sorted(df_qc, "percent_mito", "cluster_labels", hline_x=10)
+        plt.show()
+
+    if return_df_qc:
+        return df_qc
